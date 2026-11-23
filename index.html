@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>SISYPHUS — One-Button Boulder Push</title>
+<style>
+  html,body{margin:0;padding:0;background:#1a2a4a;height:100%;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;width:100vw;height:100vh;object-fit:contain;touch-action:none;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="1280" height="720"></canvas></div>
+<script>
+'use strict';
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = 1280, H = 720;
+
+// ---------- hill geometry ----------
+function hillX(p){ return 150 + p * 990; }
+function hillY(p){ return 640 - 470 * Math.pow(Math.max(0, Math.min(1, p)), 1.5); }
+function hillAngle(p){
+  const a = Math.max(0, p - 0.02), b = Math.min(1, p + 0.02);
+  return Math.atan2(hillY(b) - hillY(a), hillX(b) - hillX(a));
+}
+
+// ---------- state ----------
+const G = {
+  state: 'title',           // title | playing | summit
+  p: 0,                     // boulder progress 0..1 up the hill
+  stamina: 100,
+  round: 1,
+  score: 0,
+  lastPush: -99,
+  pushT: 0,                 // push animation timer
+  bannerT: 0,               // summit banner timer
+  taunt: '', tauntT: 0,
+  mutter: '', mutterT: 0,
+  exhaustedT: 0,
+  rollingBack: false,
+  boulderRot: 0,
+  sweat: [],                // sweat particles {x,y,vx,vy,life}
+  clouds: [
+    { x: 120, y: 80, s: 1.0, v: 6 },
+    { x: 520, y: 130, s: 0.7, v: 9 },
+    { x: 900, y: 60, s: 1.2, v: 5 },
+    { x: 1120, y: 190, s: 0.6, v: 11 }
+  ],
+  startT: 0
+};
+const MUTTERS = ['Almost there...', 'My back!', 'Zeus, really?', 'One more push!', 'This boulder again...', 'Why me?', 'Leg day... forever.', 'So close!'];
+const TAUNTS = ['Again.', 'HA!', 'Nice try, mortal.', 'The hill always wins.', 'Round two, Sisyphus.'];
+
+function staminaCost(){ return Math.min(14, 8 + (G.round - 1)); }
+function pushPower(){
+  return 0.014 * (1 - 0.45 * G.p) * Math.max(0.55, 1 - 0.08 * (G.round - 1));
+}
+function rollbackRate(){
+  return 0.022 * (0.6 + G.p) * (1 + 0.12 * (G.round - 1));
+}
+
+function doPush(now){
+  if (G.state === 'title'){ G.state = 'playing'; G.startT = now; return; }
+  if (G.state !== 'playing') return;
+  if (G.stamina < staminaCost()){
+    G.exhaustedT = 0.7;
+    return;
+  }
+  G.stamina -= staminaCost();
+  const dp = pushPower();
+  G.p = Math.min(1, G.p + dp);
+  G.score += Math.round(dp * 100) * 10;
+  G.lastPush = now;
+  G.pushT = 0.16;
+  G.mutter = MUTTERS[Math.floor(Math.random() * MUTTERS.length)];
+  G.mutterT = 1.4;
+  if (G.stamina < 35){
+    for (let i = 0; i < 3; i++){
+      G.sweat.push({ x: hillX(G.p) - 90, y: hillY(G.p) - 150, vx: -40 - Math.random() * 60, vy: -60 - Math.random() * 60, life: 0.7 });
+    }
+  }
+  if (G.p >= 1) reachSummit();
+}
+
+function reachSummit(){
+  G.state = 'summit';
+  G.bannerT = 2.6;
+  G.score += 500;
+  G.taunt = '';
+  G.tauntT = 0;
+}
+
+function nextRound(){
+  G.round += 1;
+  G.p = 0;
+  G.stamina = 100;
+  G.lastPush = -99;
+  G.state = 'playing';
+  G.boulderRot = 0;
+}
+
+// ---------- input ----------
+function onPush(e){
+  if (e) e.preventDefault();
+  doPush(performance.now() / 1000);
+}
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'Enter'){ onPush(e); }
+});
+cv.addEventListener('pointerdown', onPush);
+cv.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+
+// ---------- update ----------
+let lastT = performance.now() / 1000;
+function update(now){
+  const dt = Math.min(0.05, now - lastT);
+  lastT = now;
+  for (const c of G.clouds){ c.x += c.v * dt; if (c.x > W + 120) c.x = -140; }
+  if (G.pushT > 0) G.pushT -= dt;
+  if (G.bannerT > 0) G.bannerT -= dt;
+  if (G.tauntT > 0) G.tauntT -= dt;
+  if (G.mutterT > 0) G.mutterT -= dt;
+  if (G.exhaustedT > 0) G.exhaustedT -= dt;
+  for (const s of G.sweat){ s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 220 * dt; s.life -= dt; }
+  G.sweat = G.sweat.filter(s => s.life > 0);
+
+  if (G.state === 'playing'){
+    // stamina regen when not pushing
+    if (now - G.lastPush > 0.3 && G.stamina < 100){
+      G.stamina = Math.min(100, G.stamina + 26 * dt);
+    }
+    // rollback after 1.2s idle
+    const idle = now - G.lastPush;
+    if (G.lastPush > 0 && idle > 1.2 && G.p > 0){
+      G.p = Math.max(0, G.p - rollbackRate() * dt);
+      G.rollingBack = true;
+      if (G.tauntT <= 0){
+        G.taunt = TAUNTS[Math.floor(Math.random() * TAUNTS.length)];
+        G.tauntT = 1.8;
+      }
+    } else {
+      G.rollingBack = false;
+    }
+    G.boulderRot = G.p * 25;
+  }
+  if (G.state === 'summit' && G.bannerT <= 0) nextRound();
+}
+
+// ---------- drawing ----------
+function drawCloud(x, y, s){
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.beginPath();
+  ctx.arc(x, y, 26 * s, 0, Math.PI * 2);
+  ctx.arc(x + 28 * s, y - 8 * s, 30 * s, 0, Math.PI * 2);
+  ctx.arc(x + 62 * s, y, 26 * s, 0, Math.PI * 2);
+  ctx.arc(x + 30 * s, y + 10 * s, 26 * s, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawTemple(){
+  const tx = 1130, ty = hillY(1) - 4;
+  ctx.fillStyle = '#f5efe0';
+  ctx.fillRect(tx - 55, ty - 44, 110, 12);           // roof base
+  ctx.beginPath();                                    // pediment (apex clears the HUD panel)
+  ctx.moveTo(tx - 62, ty - 44); ctx.lineTo(tx, ty - 60); ctx.lineTo(tx + 62, ty - 44);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#fff8e6';
+  for (let i = -2; i <= 2; i++) ctx.fillRect(tx + i * 24 - 5, ty - 32, 10, 32); // columns
+  ctx.fillStyle = '#e8ddc0';
+  ctx.fillRect(tx - 60, ty, 120, 8);
+}
+
+function drawBoulder(bx, by){
+  ctx.save();
+  ctx.translate(bx, by);
+  ctx.rotate(G.boulderRot);
+  const r = 46;
+  const g = ctx.createRadialGradient(-14, -16, 8, 0, 0, r + 4);
+  g.addColorStop(0, '#b9bec7'); g.addColorStop(1, '#6f7480');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#565b66'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, 0, r - 1, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = '#4c515c'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(-22, -8); ctx.lineTo(-6, 4); ctx.lineTo(-14, 20); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(12, -22); ctx.lineTo(20, -4); ctx.lineTo(8, 8); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSisyphus(sx, sy, angle){
+  const lean = angle * 0.45 + (G.pushT > 0 ? -0.16 : -0.06);
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(lean);
+  // legs
+  ctx.strokeStyle = '#8a6b4f'; ctx.lineWidth = 9; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(0, -42); ctx.lineTo(-14, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -42); ctx.lineTo(12, -2); ctx.stroke();
+  // tunic
+  ctx.fillStyle = '#f2ead8';
+  ctx.beginPath();
+  ctx.moveTo(-14, -86); ctx.lineTo(12, -86); ctx.lineTo(8, -38); ctx.lineTo(-10, -38);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#b03a2e'; ctx.fillRect(-12, -52, 22, 6); // belt
+  // arms reaching to boulder
+  ctx.strokeStyle = '#c98f6b'; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.moveTo(6, -80); ctx.lineTo(44, -66); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, -72); ctx.lineTo(44, -52); ctx.stroke();
+  // head + beard + hair
+  ctx.fillStyle = '#e8b98d';
+  ctx.beginPath(); ctx.arc(2, -98, 13, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#5b4632';
+  ctx.beginPath(); ctx.arc(0, -104, 13, Math.PI, 0); ctx.fill(); // hair
+  ctx.fillStyle = '#d8d8d8';
+  ctx.beginPath(); ctx.arc(8, -90, 7, 0, Math.PI); ctx.fill();    // beard
+  // straining eye
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.arc(8, -100, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#7ec3ee'); sky.addColorStop(0.55, '#bfe3f7'); sky.addColorStop(1, '#ffe9b0');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+  // sun (clear of HUD, temple and the push prompt text)
+  ctx.fillStyle = '#ffd94d';
+  ctx.beginPath(); ctx.arc(820, 230, 42, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ffe98a';
+  ctx.beginPath(); ctx.arc(820, 230, 32, 0, Math.PI * 2); ctx.fill();
+  // distant mountains
+  ctx.fillStyle = '#9db8d6';
+  ctx.beginPath(); ctx.moveTo(0, 640); ctx.lineTo(220, 420); ctx.lineTo(430, 640); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(330, 640); ctx.lineTo(560, 470); ctx.lineTo(760, 640); ctx.closePath(); ctx.fill();
+  for (const c of G.clouds) drawCloud(c.x, c.y, c.s);
+
+  // hill
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 16){
+    const p = Math.max(0, Math.min(1, (x - 150) / 990));
+    ctx.lineTo(x, hillY(p));
+  }
+  ctx.lineTo(W, H); ctx.closePath();
+  ctx.fillStyle = '#8a6a45'; ctx.fill();
+  // grass edge
+  ctx.strokeStyle = '#5da244'; ctx.lineWidth = 12; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 16){
+    const p = Math.max(0, Math.min(1, (x - 150) / 990));
+    const y = hillY(p);
+    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // grass tufts + small rocks on the slope
+  ctx.strokeStyle = '#4c8a38'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  for (const tp of [0.12, 0.25, 0.38, 0.5, 0.62, 0.72, 0.82]){
+    const tx = hillX(tp), ty = hillY(tp) - 4;
+    ctx.beginPath();
+    ctx.moveTo(tx - 8, ty); ctx.lineTo(tx - 10, ty - 12);
+    ctx.moveTo(tx, ty); ctx.lineTo(tx, ty - 15);
+    ctx.moveTo(tx + 8, ty); ctx.lineTo(tx + 10, ty - 11);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#7a7f88';
+  for (const rp of [0.3, 0.55, 0.78]){
+    ctx.beginPath(); ctx.arc(hillX(rp) + 40, hillY(rp) - 4, 7, 0, Math.PI * 2); ctx.fill();
+  }
+  // slope steepness ticks
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  for (let p = 0.2; p < 1; p += 0.2){
+    ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(Math.round(p * 100) + 'm', hillX(p), hillY(p) + 34);
+  }
+  drawTemple();
+
+  // Zeus in a cloud on the left (clear of temple, sun and HUD)
+  drawCloud(300, 140, 0.85);
+  ctx.fillStyle = '#f0e6d2';
+  ctx.beginPath(); ctx.arc(300, 148, 20, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(300, 160, 16, 0, Math.PI); ctx.fill(); // beard
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.arc(293, 144, 2.5, 0, Math.PI * 2); ctx.arc(307, 144, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#e8c33a'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(284, 134); ctx.lineTo(316, 134); ctx.stroke(); // laurel
+  if (G.tauntT > 0){
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+    ctx.font = 'bold 17px sans-serif';
+    const tw = ctx.measureText(G.taunt).width + 28;
+    ctx.beginPath(); ctx.roundRect(360, 128, tw, 36, 10); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#222'; ctx.textAlign = 'center';
+    ctx.fillText(G.taunt, 360 + tw / 2, 152);
+    ctx.fillStyle = '#888'; ctx.font = 'bold 11px sans-serif';
+    ctx.fillText('— ZEUS', 360 + tw / 2, 182);
+  }
+
+  // boulder + Sisyphus (Sisyphus stands ON the slope behind the boulder)
+  const bx = hillX(G.p), by = hillY(G.p) - 44;
+  const ang = hillAngle(G.p);
+  const sx = bx - 74, sy = hillY(Math.max(0, G.p - 0.075));
+  drawSisyphus(sx, sy, ang);
+  drawBoulder(bx, by);
+
+  // sweat
+  ctx.fillStyle = '#7ec8f7';
+  for (const s of G.sweat){
+    ctx.globalAlpha = Math.max(0, s.life / 0.7);
+    ctx.beginPath(); ctx.arc(s.x, s.y, 4, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // mutter bubble
+  if (G.mutterT > 0 && G.state === 'playing'){
+    ctx.font = 'italic bold 18px sans-serif';
+    const mw = ctx.measureText(G.mutter).width + 24;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.beginPath(); ctx.roundRect(sx - mw / 2, sy - 168, mw, 32, 10); ctx.fill();
+    ctx.fillStyle = '#333'; ctx.textAlign = 'center';
+    ctx.fillText(G.mutter, sx, sy - 146);
+  }
+
+  // ---------- HUD ----------
+  ctx.textAlign = 'left';
+  // top panel
+  ctx.fillStyle = 'rgba(10,20,40,0.55)';
+  ctx.beginPath(); ctx.roundRect(14, 12, 620, 92, 12); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 24px sans-serif';
+  ctx.fillText('ROUND ' + G.round, 30, 46);
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('SCORE ' + G.score, 200, 46);
+  ctx.fillText('HEIGHT ' + Math.floor(G.p * 100) + 'm', 400, 46);
+  // stamina bar
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.beginPath(); ctx.roundRect(30, 62, 300, 22, 8); ctx.fill();
+  const sc = G.stamina > 50 ? '#58d158' : G.stamina > 25 ? '#ffcf3f' : '#ff5a4d';
+  ctx.fillStyle = sc;
+  ctx.beginPath(); ctx.roundRect(30, 62, 300 * (G.stamina / 100), 22, 8); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 16px sans-serif';
+  ctx.fillText('STAMINA', 342, 79);
+  if (G.exhaustedT > 0){
+    ctx.fillStyle = '#ff5a4d'; ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('EXHAUSTED! Rest a sec...', 470, 79);
+  }
+  // progress to summit
+  ctx.fillStyle = 'rgba(10,20,40,0.55)';
+  ctx.beginPath(); ctx.roundRect(660, 12, 606, 92, 12); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('TO SUMMIT', 676, 40);
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.beginPath(); ctx.roundRect(676, 52, 520, 20, 8); ctx.fill();
+  ctx.fillStyle = '#ffd94d';
+  ctx.beginPath(); ctx.roundRect(676, 52, 520 * G.p, 20, 8); ctx.fill();
+  ctx.font = 'bold 20px sans-serif'; ctx.fillText('⛰', 1210, 72);
+
+  // rolling back warning
+  if (G.rollingBack){
+    ctx.fillStyle = '#ff5a4d'; ctx.font = 'bold 30px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('IT\u2019S ROLLING BACK! PUSH!', W / 2, 170);
+  }
+  // push prompt
+  if (G.state === 'playing' && !G.rollingBack){
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(G.pushT > 0 ? 'PUSH! PUSH! PUSH!' : 'SPACE / TAP TO PUSH', W / 2, 170);
+  }
+
+  // ---------- title screen ----------
+  if (G.state === 'title'){
+    ctx.fillStyle = 'rgba(10,20,40,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd94d'; ctx.font = 'bold 96px sans-serif';
+    ctx.fillText('SISYPHUS', W / 2, 240);
+    ctx.fillStyle = '#fff'; ctx.font = 'italic 30px sans-serif';
+    ctx.fillText('The boulder. The hill. Forever.', W / 2, 292);
+    ctx.font = '22px sans-serif';
+    ctx.fillText('SPACE or TAP to push  •  watch your stamina', W / 2, 350);
+    ctx.fillText('Stop too long and the boulder rolls back down', W / 2, 384);
+    ctx.fillText('Reach the summit to start a harder round', W / 2, 418);
+    ctx.fillStyle = '#ffd94d'; ctx.font = 'bold 34px sans-serif';
+    ctx.fillText('PRESS SPACE / TAP TO START', W / 2, 500);
+  }
+
+  // ---------- summit banner ----------
+  if (G.state === 'summit'){
+    ctx.fillStyle = 'rgba(10,20,40,0.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd94d'; ctx.font = 'bold 84px sans-serif';
+    ctx.fillText('⛰ SUMMIT! ⛰', W / 2, 330);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 32px sans-serif';
+    ctx.fillText('Round ' + G.round + ' cleared  •  +500 bonus', W / 2, 392);
+    ctx.font = 'italic 26px sans-serif';
+    ctx.fillText('...and the boulder is back at the bottom. Of course.', W / 2, 436);
+  }
+}
+
+function frame(nowMs){
+  const now = nowMs / 1000;
+  update(now);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// debug hook for playtest / screenshots (not part of gameplay)
+window.__sis = {
+  get state(){ return G.state; },
+  get p(){ return G.p; },
+  get stamina(){ return G.stamina; },
+  get round(){ return G.round; },
+  get score(){ return G.score; },
+  get rollingBack(){ return G.rollingBack; },
+  setProgress(v){ G.p = Math.max(0, Math.min(0.99, v)); G.lastPush = performance.now() / 1000; },
+  start(){ if (G.state === 'title'){ G.state = 'playing'; G.startT = performance.now() / 1000; } }
+};
+</script>
+</body>
+</html>
